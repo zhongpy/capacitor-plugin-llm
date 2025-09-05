@@ -191,9 +191,9 @@ public class LLMPlugin extends Plugin {
       java.util.List<String> hiErr = new java.util.ArrayList<>();
       java.util.List<String> hiFreq = new java.util.ArrayList<>();
       if (cons != null) {
-        JSONArray a = cons.getArray("high_error_words");
+        JSONArray a = cons.getJSONArray("high_error_words");
         if (a != null) for (int i = 0; i < a.length(); i++) hiErr.add(a.getString(i));
-        a = cons.getArray("high_freq_words");
+        a = cons.getJSONArray("high_freq_words");
         if (a != null) for (int i = 0; i < a.length(); i++) hiFreq.add(a.getString(i));
       }
 
