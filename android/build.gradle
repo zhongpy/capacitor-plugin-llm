@@ -21,14 +21,26 @@ android {
     namespace "com.kingsun.plugins.llm"
     compileSdk project.hasProperty('compileSdkVersion') ? rootProject.ext.compileSdkVersion : 35
     defaultConfig {
-        minSdkVersion project.hasProperty('minSdkVersion') ? rootProject.ext.minSdkVersion : 23
+        minSdkVersion project.hasProperty('minSdkVersion') ? rootProject.ext.minSdkVersion : 24
         targetSdkVersion project.hasProperty('targetSdkVersion') ? rootProject.ext.targetSdkVersion : 35
         versionCode 1
         versionName "1.0"
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
+        ndk { abiFilters "arm64-v8a" }
+        externalNativeBuild {
+            cmake {
+                cppFlags "-std=c++20 -fexceptions -frtti -O2 -fvisibility=hidden"
+                arguments "-DANDROID_STL=c++_shared"
+            }
+        }
     }
     buildTypes {
+        debug {
+            // 方便 native 调试：保留符号表（也可改 FULL 保留全符号）
+            ndk { debugSymbolLevel "SYMBOL_TABLE" }
+        }
         release {
+            ndk { debugSymbolLevel "SYMBOL_TABLE" }
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android.txt'), 'proguard-rules.pro'
         }
@@ -40,6 +52,22 @@ android {
         sourceCompatibility JavaVersion.VERSION_21
         targetCompatibility JavaVersion.VERSION_21
     }
+    externalNativeBuild {
+        cmake {
+        path "src/main/cpp/CMakeLists.txt"
+        version "3.22.1"
+        }
+    }
+    // 打包策略：避免与其它库的 c++_shared / Vulkan loader 冲突
+    packagingOptions {
+        // c++_shared.so 会由 AGP 自动打进来（使用 externalNativeBuild 时）；
+        // 如遇多份冲突，可保留一份：
+        pickFirst "lib/**/libc++_shared.so"
+        // 如果你的第三方库也带了 libvulkan.so（通常不会），同理处理：
+        // pickFirst "lib/**/libvulkan.so"
+    }
+
+    ndkVersion '29.0.13599879'
 }
 
 repositories {

@@ -1,0 +1,318 @@
+{
+  "api": {
+    "name": "LLMPlugin",
+    "slug": "llmplugin",
+    "docs": "",
+    "tags": [],
+    "methods": [
+      {
+        "name": "init",
+        "signature": "(options: InitOptions) => any",
+        "parameters": [
+          {
+            "name": "options",
+            "docs": "",
+            "type": "InitOptions"
+          }
+        ],
+        "returns": "any",
+        "tags": [],
+        "docs": "初始化（复制/下载模型 + nativeInit）",
+        "complexTypes": [
+          "InitOptions"
+        ],
+        "slug": "init"
+      },
+      {
+        "name": "chat",
+        "signature": "(options: ChatOptions) => any",
+        "parameters": [
+          {
+            "name": "options",
+            "docs": "",
+            "type": "ChatOptions"
+          }
+        ],
+        "returns": "any",
+        "tags": [],
+        "docs": "开始流式对话（逐 token 触发 llmToken，结束触发 llmDone）",
+        "complexTypes": [
+          "ChatOptions"
+        ],
+        "slug": "chat"
+      },
+      {
+        "name": "stop",
+        "signature": "() => any",
+        "parameters": [],
+        "returns": "any",
+        "tags": [],
+        "docs": "尝试中断当前流式生成",
+        "complexTypes": [],
+        "slug": "stop"
+      },
+      {
+        "name": "free",
+        "signature": "() => any",
+        "parameters": [],
+        "returns": "any",
+        "tags": [],
+        "docs": "释放底层资源（模型/上下文）",
+        "complexTypes": [],
+        "slug": "free"
+      },
+      {
+        "name": "generateEssay",
+        "signature": "(options: GenerateEssayOptions) => any",
+        "parameters": [
+          {
+            "name": "options",
+            "docs": "",
+            "type": "GenerateEssayOptions"
+          }
+        ],
+        "returns": "any",
+        "tags": [],
+        "docs": "一次性生成（作文）",
+        "complexTypes": [
+          "GenerateEssayOptions"
+        ],
+        "slug": "generateessay"
+      },
+      {
+        "name": "addListener",
+        "signature": "(eventName: 'llmToken', listenerFunc: (event: LLMTokenEvent) => void) => any",
+        "parameters": [
+          {
+            "name": "eventName",
+            "docs": "",
+            "type": "'llmToken'"
+          },
+          {
+            "name": "listenerFunc",
+            "docs": "",
+            "type": "(event: LLMTokenEvent) => void"
+          }
+        ],
+        "returns": "any",
+        "tags": [],
+        "docs": "",
+        "complexTypes": [
+          "LLMTokenEvent",
+          "PluginListenerHandle"
+        ],
+        "slug": "addlistenerllmtoken-"
+      },
+      {
+        "name": "addListener",
+        "signature": "(eventName: 'llmDone', listenerFunc: (event: any) => void) => any",
+        "parameters": [
+          {
+            "name": "eventName",
+            "docs": "",
+            "type": "'llmDone'"
+          },
+          {
+            "name": "listenerFunc",
+            "docs": "",
+            "type": "(event: any) => void"
+          }
+        ],
+        "returns": "any",
+        "tags": [],
+        "docs": "",
+        "complexTypes": [
+          "LLMDoneEvent",
+          "PluginListenerHandle"
+        ],
+        "slug": "addlistenerllmdone-"
+      },
+      {
+        "name": "addListener",
+        "signature": "(eventName: 'llmError', listenerFunc: (event: LLMErrorEvent) => void) => any",
+        "parameters": [
+          {
+            "name": "eventName",
+            "docs": "",
+            "type": "'llmError'"
+          },
+          {
+            "name": "listenerFunc",
+            "docs": "",
+            "type": "(event: LLMErrorEvent) => void"
+          }
+        ],
+        "returns": "any",
+        "tags": [],
+        "docs": "",
+        "complexTypes": [
+          "LLMErrorEvent",
+          "PluginListenerHandle"
+        ],
+        "slug": "addlistenerllmerror-"
+      }
+    ],
+    "properties": []
+  },
+  "interfaces": [
+    {
+      "name": "InitOptions",
+      "slug": "initoptions",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "assetPath",
+          "tags": [],
+          "docs": "优先从 assets 复制（例：models/Qwen3-0.6B-Instruct-q4_k_m.gguf）",
+          "complexTypes": [],
+          "type": "string | undefined"
+        },
+        {
+          "name": "expectedSha256",
+          "tags": [],
+          "docs": "可选的 SHA256 校验（hex 小写/大写都可）",
+          "complexTypes": [],
+          "type": "string | undefined"
+        },
+        {
+          "name": "modelPath",
+          "tags": [],
+          "docs": "已存在的绝对路径（若提供优先生效）",
+          "complexTypes": [],
+          "type": "string | undefined"
+        },
+        {
+          "name": "remoteUrl",
+          "tags": [],
+          "docs": "本地没有则从该 URL 下载到 filesDir/models/",
+          "complexTypes": [],
+          "type": "string | undefined"
+        },
+        {
+          "name": "nCtx",
+          "tags": [],
+          "docs": "上下文长度（默认 1024）",
+          "complexTypes": [],
+          "type": "number | undefined"
+        }
+      ]
+    },
+    {
+      "name": "ChatOptions",
+      "slug": "chatoptions",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "prompt",
+          "tags": [],
+          "docs": "用户提示词（会包上 ChatML 模板）",
+          "complexTypes": [],
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "GenerateEssayOptions",
+      "slug": "generateessayoptions",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "title",
+          "tags": [],
+          "docs": "作文标题",
+          "complexTypes": [],
+          "type": "string | undefined"
+        },
+        {
+          "name": "word_limit",
+          "tags": [],
+          "docs": "目标字数（近似）",
+          "complexTypes": [],
+          "type": "number | undefined"
+        },
+        {
+          "name": "lang",
+          "tags": [],
+          "docs": "语言（默认 en）",
+          "complexTypes": [],
+          "type": "string | undefined"
+        },
+        {
+          "name": "constraints",
+          "tags": [],
+          "docs": "约束条件",
+          "complexTypes": [],
+          "type": "{ high_error_words?: {} | undefined; high_freq_words?: {} | undefined; } | undefined"
+        },
+        {
+          "name": "max_new_tokens",
+          "tags": [],
+          "docs": "最大新生成 tokens（默认 max(256, word_limit*3)）",
+          "complexTypes": [],
+          "type": "number | undefined"
+        }
+      ]
+    },
+    {
+      "name": "PluginListenerHandle",
+      "slug": "pluginlistenerhandle",
+      "docs": "",
+      "tags": [],
+      "methods": [],
+      "properties": [
+        {
+          "name": "remove",
+          "tags": [],
+          "docs": "",
+          "complexTypes": [],
+          "type": "() => any"
+        }
+      ]
+    }
+  ],
+  "enums": [],
+  "typeAliases": [
+    {
+      "name": "LLMTokenEvent",
+      "slug": "llmtokenevent",
+      "docs": "",
+      "types": [
+        {
+          "text": "{ token: string }",
+          "complexTypes": []
+        }
+      ]
+    },
+    {
+      "name": "LLMDoneEvent",
+      "slug": "llmdoneevent",
+      "docs": "",
+      "types": [
+        {
+          "text": "Record<string, never>",
+          "complexTypes": [
+            "Record"
+          ]
+        }
+      ]
+    },
+    {
+      "name": "LLMErrorEvent",
+      "slug": "llmerrorevent",
+      "docs": "",
+      "types": [
+        {
+          "text": "{ message: string }",
+          "complexTypes": []
+        }
+      ]
+    }
+  ],
+  "pluginConfigs": []
+}
