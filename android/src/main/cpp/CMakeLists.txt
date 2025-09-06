@@ -4,9 +4,8 @@ project(llama_jni)
 
 add_library(llama_jni SHARED llama_jni.cpp)
 
-set(LLAMA_SRC "E:/Work/Git/llama.cpp")
 target_include_directories(llama_jni PRIVATE
-        ${LLAMA_SRC}/build-android/stage/include          # 含 llama.h
+        ${CMAKE_CURRENT_LIST_DIR}/third_part/include          # 含 llama.h
 )
 
 # 链接 llama 共享库
