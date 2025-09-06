@@ -2,6 +2,7 @@ package com.kingsun.plugins.llm;
 
 import android.content.Context;
 import android.content.res.AssetManager;
+import android.util.Log;
 
 import com.getcapacitor.*;
 
@@ -31,6 +32,8 @@ public class LLMPlugin extends Plugin {
 
   private final ExecutorService worker = Executors.newSingleThreadExecutor();
   private volatile PluginCall streamingCall;
+
+  private static final String TAG="LLMPlugin";
 
   // ====== 对外：init ======
   // 参数示例：
@@ -117,6 +120,7 @@ public class LLMPlugin extends Plugin {
     streamingCall = call;
     worker.execute(() -> {
       try {
+        Log.i(TAG,"start input prompt to nativeChatStream!");
         nativeChatStream(prompt);
       } catch (Throwable t) {
         JSObject ev = new JSObject().put("message", "nativeChatStream error: " + t.getMessage());
@@ -128,12 +132,14 @@ public class LLMPlugin extends Plugin {
 
   // JNI 回调：逐 token
   public void onNativeToken(String token) {
+    Log.i(TAG,"Get Token from native stream!");
     JSObject ev = new JSObject().put("token", token);
     notifyListeners("llmToken", ev);
   }
 
   // JNI 回调：完成
   public synchronized void onNativeDone() {
+    Log.i(TAG,"Get Done from native stream!");
     notifyListeners("llmDone", new JSObject());
     if (streamingCall != null) {
       streamingCall.resolve();

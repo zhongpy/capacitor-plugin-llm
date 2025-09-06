@@ -6,13 +6,19 @@
 #include <algorithm>
 #include <limits>
 #include "llama.h"
+#include <android/log.h>
 
 // ===== 全局（单模型/单上下文） =====
 static llama_model*           g_model  = nullptr;
 static llama_context*         g_ctx    = nullptr;
 static const llama_vocab*     g_vocab  = nullptr;
 static std::atomic<bool>      g_stop{false};
-
+#define LOG_TAG "MyNativeModule"
+#define LOGV(...) __android_log_print(ANDROID_LOG_VERBOSE, LOG_TAG, __VA_ARGS__)
+#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
 // ===== ChatML（Qwen3风格）prompt =====
 static std::string build_chatml_prompt(const std::string& user) {
     std::string s;
@@ -57,24 +63,79 @@ static std::string build_essay_prompt(
     return s;
 }
 
-// ===== Java 回调：把 token / 完成 通知回 Java（调用 LLMPlugin.onNativeToken / onNativeDone）=====
-static void emit_token(JNIEnv* env, jobject callback_this, const std::string& tok) {
-    if (!callback_this) return;
-    jclass cls = env->GetObjectClass(callback_this);
-    if (!cls) return;
-    jmethodID mid = env->GetMethodID(cls, "onNativeToken", "(Ljava/lang/String;)V");
-    if (!mid) return;
-    jstring jtok = env->NewStringUTF(tok.c_str());
-    env->CallVoidMethod(callback_this, mid, jtok);
+// 放在文件顶部全局区
+static std::string g_pending_utf8;
+
+// 返回 s 中“最后一个**完整** UTF-8 码点边界”的下标（可发出的长度）
+static size_t utf8_last_complete(const std::string& s) {
+    // 从尾部最多回看 3 字节，判定是否位于多字节序列中
+    size_t n = s.size();
+    if (n == 0) return 0;
+    size_t i = n;
+    int cont = 0;
+    // 向左扫描最多 3 字节，数连续的 10xxxxxx
+    for (size_t k = 0; k < 3 && i > 0; ++k) {
+        unsigned char c = (unsigned char)s[i - 1];
+        if ((c & 0xC0) == 0x80) { // 10xxxxxx
+            ++cont;
+            --i;
+        } else break;
+    }
+    if (i == 0) {
+        // 全是续字节 -> 不完整
+        return 0;
+    }
+    unsigned char lead = (unsigned char)s[i - 1];
+    int need = 1;
+    if ((lead & 0x80) == 0x00) need = 1;           // 0xxxxxxx
+    else if ((lead & 0xE0) == 0xC0) need = 2;      // 110xxxxx
+    else if ((lead & 0xF0) == 0xE0) need = 3;      // 1110xxxx
+    else if ((lead & 0xF8) == 0xF0) need = 4;      // 11110xxx
+    else return i - 1; // 非法领头，保守起见只到前一个字节
+
+    int have = n - (int)(i - 1);
+    if (have >= need) return n;     // 末尾完整
+    return n - (need - have);       // 去掉不完整的尾部字节
+}
+
+// 仅把“完整 UTF-8”部分抛给 Java，尾巴留在 g_pending_utf8
+// —— 新版：不再每次 GetObjectClass/GetMethodID ——
+
+// 把完整 UTF-8 片段发给 Java
+static void emit_utf8_safely(JNIEnv* env, jobject cb, jclass cbCls, jmethodID midOnToken,
+                             const std::string& chunk) {
+    //static std::string g_pending_utf8;  // 迁到函数静态也行；若你全局已定义就删这行
+    std::string &buf = g_pending_utf8;
+    buf.append(chunk);
+    size_t cut = utf8_last_complete(buf);
+    if (cut == 0) return;
+
+    std::string out = buf.substr(0, cut);
+    buf.erase(0, cut);
+
+    jstring jtok = env->NewStringUTF(out.c_str());
+    if (!jtok) return;
+    env->CallVoidMethod(cb, midOnToken, jtok);
     env->DeleteLocalRef(jtok);
 }
-static void emit_done(JNIEnv* env, jobject callback_this) {
-    if (!callback_this) return;
-    jclass cls = env->GetObjectClass(callback_this);
-    if (!cls) return;
-    jmethodID mid = env->GetMethodID(cls, "onNativeDone", "()V");
-    if (!mid) return;
-    env->CallVoidMethod(callback_this, mid);
+
+// 刷新尾巴
+static void flush_pending(JNIEnv* env, jobject cb, jclass cbCls, jmethodID midOnToken) {
+    //extern std::string g_pending_utf8; // 你原来的全局变量
+    if (g_pending_utf8.empty()) return;
+
+    size_t cut = utf8_last_complete(g_pending_utf8);
+    if (cut == 0) return;
+
+    std::string out = g_pending_utf8.substr(0, cut);
+    g_pending_utf8.erase(0, cut);
+
+    if (!out.empty()) {
+        jstring jtok = env->NewStringUTF(out.c_str());
+        if (!jtok) return;
+        env->CallVoidMethod(cb, midOnToken, jtok);
+        env->DeleteLocalRef(jtok);
+    }
 }
 
 // ===== logits / 词表大小（不同提交可能有不同 API 名称，这里做个轻量封装）=====
@@ -184,6 +245,7 @@ extern "C" JNIEXPORT void JNICALL
 Java_com_kingsun_plugins_llm_LLMPlugin_nativeFree(JNIEnv*, jclass) {
     if (g_ctx)   { llama_free(g_ctx); g_ctx = nullptr; }
     if (g_model) { llama_free_model(g_model); g_model = nullptr; }
+    g_pending_utf8.clear();
     g_vocab = nullptr;
     llama_backend_free();
 }
@@ -192,13 +254,23 @@ Java_com_kingsun_plugins_llm_LLMPlugin_nativeFree(JNIEnv*, jclass) {
 extern "C" JNIEXPORT void JNICALL
 Java_com_kingsun_plugins_llm_LLMPlugin_nativeStop(JNIEnv*, jclass) {
     g_stop = true;
+    g_pending_utf8.clear();
 }
 
 // ===== JNI: 流式对话 =====
 extern "C" JNIEXPORT void JNICALL
 Java_com_kingsun_plugins_llm_LLMPlugin_nativeChatStream(JNIEnv* env, jobject thiz, jstring userText_) {
+    LOGI("Enter nativeChatStream");
     if (!g_ctx || !g_model || !g_vocab) return;
-
+    LOGI("Process nativeChatStream Step-1");
+    // ① 缓存类与方法 ID（本次调用内复用）
+    jclass cbCls = env->GetObjectClass(thiz);
+    if (!cbCls) return;
+    LOGI("Process nativeChatStream Step-2");
+    jmethodID midOnToken = env->GetMethodID(cbCls, "onNativeToken", "(Ljava/lang/String;)V");
+    jmethodID midOnDone  = env->GetMethodID(cbCls, "onNativeDone",  "()V");
+    if (!midOnToken || !midOnDone) { env->DeleteLocalRef(cbCls); return; }
+    LOGI("Process nativeChatStream Step-3");
     const char* ut = env->GetStringUTFChars(userText_, nullptr);
     std::string prompt = build_chatml_prompt(ut ? std::string(ut) : std::string());
     env->ReleaseStringUTFChars(userText_, ut);
@@ -206,7 +278,7 @@ Java_com_kingsun_plugins_llm_LLMPlugin_nativeChatStream(JNIEnv* env, jobject thi
     // Prefill
     std::vector<llama_token> ptok = tokenize_text(prompt, /*add_special*/true, /*parse_special*/true);
     if (ptok.empty()) return;
-
+    LOGI("Process nativeChatStream Step-4");
     g_stop = false;
 
     // 预填充
@@ -222,7 +294,7 @@ Java_com_kingsun_plugins_llm_LLMPlugin_nativeChatStream(JNIEnv* env, jobject thi
             return;
         }
     }
-
+    LOGI("Process nativeChatStream Step-5");
     const llama_token tok_eos = llama_vocab_eos(g_vocab);
     const int32_t n_vocab = vocab_size(g_vocab, g_ctx);
 
@@ -238,9 +310,9 @@ Java_com_kingsun_plugins_llm_LLMPlugin_nativeChatStream(JNIEnv* env, jobject thi
         llama_token next = greedy_argmax(logits, n_vocab);
         if (next == tok_eos) break;
 
-        // 回调单个 token
+        // ② 使用缓存的 midOnToken 发送（不会产生类引用泄漏）
         std::string piece = detok_piece(next);
-        if (!piece.empty()) emit_token(env, thiz, piece);
+        if (!piece.empty()) emit_utf8_safely(env, thiz, cbCls, midOnToken, piece);
 
         // 送回模型并请求输出 logits
         step.token[0]  = next;
@@ -250,8 +322,10 @@ Java_com_kingsun_plugins_llm_LLMPlugin_nativeChatStream(JNIEnv* env, jobject thi
         llama_batch b = step.as_batch();
         if (llama_decode(g_ctx, b) != 0) break;
     }
-
-    emit_done(env, thiz);
+    flush_pending(env, thiz, cbCls, midOnToken);
+    env->CallVoidMethod(thiz, midOnDone);
+    env->DeleteLocalRef(cbCls);
+    LOGI("Process nativeChatStream Step-6");
 }
 
 // ===== JNI: 一次性生成（作文）=====
