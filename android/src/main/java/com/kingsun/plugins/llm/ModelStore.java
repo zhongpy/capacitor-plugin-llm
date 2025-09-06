@@ -1,8 +1,8 @@
 package com.kingsun.plugins.llm;
+
 import android.content.Context;
 import android.content.res.AssetFileDescriptor;
 import android.content.res.AssetManager;
-
 import java.io.*;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
@@ -17,10 +17,12 @@ public final class ModelStore {
      * @param expectedSha256 可为 null；若提供则校验不一致会强制重拷
      * @return 目标文件的绝对路径
      */
-    public static String ensureBundledModel(Context ctx,
-                                            String assetRelativePath,   // e.g. "models/Qwen3-0.6B-Instruct-q4_k_m.gguf"
-                                            String destFileName,        // e.g. "Qwen3-0.6B-Instruct-q4_k_m.gguf"
-                                            String expectedSha256) throws Exception {
+    public static String ensureBundledModel(
+        Context ctx,
+        String assetRelativePath, // e.g. "models/Qwen3-0.6B-Instruct-q4_k_m.gguf"
+        String destFileName, // e.g. "Qwen3-0.6B-Instruct-q4_k_m.gguf"
+        String expectedSha256
+    ) throws Exception {
         File modelsDir = new File(ctx.getFilesDir(), "models");
         if (!modelsDir.exists() && !modelsDir.mkdirs()) {
             throw new IOException("Failed to create models dir: " + modelsDir);
@@ -43,8 +45,7 @@ public final class ModelStore {
         File tmp = File.createTempFile(destFileName + ".", ".part", modelsDir);
 
         AssetManager am = ctx.getAssets();
-        try (InputStream in = openAsset(am, assetRelativePath);
-             OutputStream out = new BufferedOutputStream(new FileOutputStream(tmp))) {
+        try (InputStream in = openAsset(am, assetRelativePath); OutputStream out = new BufferedOutputStream(new FileOutputStream(tmp))) {
             byte[] buf = new byte[1024 * 1024];
             int n;
             while ((n = in.read(buf)) >= 0) {
@@ -59,8 +60,7 @@ public final class ModelStore {
             if (!equalsHex(expectedSha256, got)) {
                 //noinspection ResultOfMethodCallIgnored
                 tmp.delete();
-                throw new IOException("SHA256 mismatch for " + destFileName +
-                        ", expected=" + expectedSha256 + ", got=" + got);
+                throw new IOException("SHA256 mismatch for " + destFileName + ", expected=" + expectedSha256 + ", got=" + got);
             }
         }
 
@@ -88,10 +88,11 @@ public final class ModelStore {
 
     private static String sha256File(File f) throws Exception {
         MessageDigest md = MessageDigest.getInstance("SHA-256");
-        try (InputStream in = new BufferedInputStream(new FileInputStream(f));
-             DigestInputStream din = new DigestInputStream(in, md)) {
+        try (InputStream in = new BufferedInputStream(new FileInputStream(f)); DigestInputStream din = new DigestInputStream(in, md)) {
             byte[] buf = new byte[1024 * 1024];
-            while (din.read(buf) >= 0) { /* consume */ }
+            while (din.read(buf) >= 0) {
+                /* consume */
+            }
         }
         byte[] dig = md.digest();
         StringBuilder sb = new StringBuilder(dig.length * 2);

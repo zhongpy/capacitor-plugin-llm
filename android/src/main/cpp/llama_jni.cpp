@@ -5,21 +5,39 @@
 #include <cstdint>
 #include <algorithm>
 #include <limits>
+#include <memory>
+#include <mutex>
+#include <unistd.h> // sysconf
+
 #include "llama.h"
 #include <android/log.h>
 
-// ===== 全局（单模型/单上下文） =====
-static llama_model*           g_model  = nullptr;
-static llama_context*         g_ctx    = nullptr;
-static const llama_vocab*     g_vocab  = nullptr;
-static std::atomic<bool>      g_stop{false};
 #define LOG_TAG "MyNativeModule"
-#define LOGV(...) __android_log_print(ANDROID_LOG_VERBOSE, LOG_TAG, __VA_ARGS__)
-#define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, LOG_TAG, __VA_ARGS__)
-#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, LOG_TAG, __VA_ARGS__)
-#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, LOG_TAG, __VA_ARGS__)
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,  LOG_TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, LOG_TAG, __VA_ARGS__)
-// ===== ChatML（Qwen3风格）prompt =====
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,  LOG_TAG, __VA_ARGS__)
+
+// ===== 全局 =====
+static llama_model*       g_model   = nullptr;
+static llama_context*     g_ctx     = nullptr;
+static const llama_vocab* g_vocab   = nullptr;
+static std::atomic<bool>  g_stop{false};
+static std::mutex         g_mutex;
+
+static llama_context_params g_cparams{};  // 记住最近一次 init 的 cparams，便于重建上下文
+
+struct SamplerParams {
+    float temp           = 0.8f;
+    float top_p          = 0.95f;
+    int   top_k          = 40;
+    float repeat_penalty = 1.10f;
+    int   repeat_last_n  = 256;
+    float min_p          = 0.05f;
+    size_t min_keep      = 1;   // 给 top_p/min_p 用
+};
+static SamplerParams g_samp;     // 由 nativeSetSampling() 动态修改
+
+// ===== ChatML（Qwen3 风格）=====
 static std::string build_chatml_prompt(const std::string& user) {
     std::string s;
     s += "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n";
@@ -28,14 +46,13 @@ static std::string build_chatml_prompt(const std::string& user) {
     return s;
 }
 
-// ===== 作文 prompt（一次性输出）=====
+// ===== 作文 prompt（保留）=====
 static std::string build_essay_prompt(
         const std::string& title,
         int                word_limit,
         const std::string& lang,
         const std::vector<std::string>& hi_err,
         const std::vector<std::string>& hi_freq) {
-
     std::string s;
     s += "Write a " + lang + " essay.\n";
     s += "Title: " + title + "\n";
@@ -59,77 +76,40 @@ static std::string build_essay_prompt(
     }
     s += "- Avoid overly complex grammar. Keep the vocabulary practical.\n";
     s += "Now produce only the final essay content.\n";
-    // 直接用“纯文本指令”，不包 ChatML，以免模型把要求一起复述出来
     return s;
 }
 
-// 放在文件顶部全局区
+// ===== UTF-8 安全拼接 =====
 static std::string g_pending_utf8;
 
-// 返回 s 中“最后一个**完整** UTF-8 码点边界”的下标（可发出的长度）
 static size_t utf8_last_complete(const std::string& s) {
-    // 从尾部最多回看 3 字节，判定是否位于多字节序列中
     size_t n = s.size();
     if (n == 0) return 0;
     size_t i = n;
-    int cont = 0;
-    // 向左扫描最多 3 字节，数连续的 10xxxxxx
     for (size_t k = 0; k < 3 && i > 0; ++k) {
         unsigned char c = (unsigned char)s[i - 1];
-        if ((c & 0xC0) == 0x80) { // 10xxxxxx
-            ++cont;
-            --i;
-        } else break;
+        if ((c & 0xC0) == 0x80) --i; else break;
     }
-    if (i == 0) {
-        // 全是续字节 -> 不完整
-        return 0;
-    }
+    if (i == 0) return 0;
     unsigned char lead = (unsigned char)s[i - 1];
     int need = 1;
-    if ((lead & 0x80) == 0x00) need = 1;           // 0xxxxxxx
-    else if ((lead & 0xE0) == 0xC0) need = 2;      // 110xxxxx
-    else if ((lead & 0xF0) == 0xE0) need = 3;      // 1110xxxx
-    else if ((lead & 0xF8) == 0xF0) need = 4;      // 11110xxx
-    else return i - 1; // 非法领头，保守起见只到前一个字节
-
-    int have = n - (int)(i - 1);
-    if (have >= need) return n;     // 末尾完整
-    return n - (need - have);       // 去掉不完整的尾部字节
+    if ((lead & 0x80) == 0x00) need = 1;
+    else if ((lead & 0xE0) == 0xC0) need = 2;
+    else if ((lead & 0xF0) == 0xE0) need = 3;
+    else if ((lead & 0xF8) == 0xF0) need = 4;
+    else return i - 1;
+    int have = (int)(n - (i - 1));
+    if (have >= need) return n;
+    return n - (need - have);
 }
 
-// 仅把“完整 UTF-8”部分抛给 Java，尾巴留在 g_pending_utf8
-// —— 新版：不再每次 GetObjectClass/GetMethodID ——
-
-// 把完整 UTF-8 片段发给 Java
 static void emit_utf8_safely(JNIEnv* env, jobject cb, jclass cbCls, jmethodID midOnToken,
                              const std::string& chunk) {
-    //static std::string g_pending_utf8;  // 迁到函数静态也行；若你全局已定义就删这行
-    std::string &buf = g_pending_utf8;
-    buf.append(chunk);
-    size_t cut = utf8_last_complete(buf);
-    if (cut == 0) return;
-
-    std::string out = buf.substr(0, cut);
-    buf.erase(0, cut);
-
-    jstring jtok = env->NewStringUTF(out.c_str());
-    if (!jtok) return;
-    env->CallVoidMethod(cb, midOnToken, jtok);
-    env->DeleteLocalRef(jtok);
-}
-
-// 刷新尾巴
-static void flush_pending(JNIEnv* env, jobject cb, jclass cbCls, jmethodID midOnToken) {
-    //extern std::string g_pending_utf8; // 你原来的全局变量
-    if (g_pending_utf8.empty()) return;
-
+    g_pending_utf8.append(chunk);
     size_t cut = utf8_last_complete(g_pending_utf8);
     if (cut == 0) return;
-
     std::string out = g_pending_utf8.substr(0, cut);
     g_pending_utf8.erase(0, cut);
-
     if (!out.empty()) {
         jstring jtok = env->NewStringUTF(out.c_str());
         if (!jtok) return;
@@ -138,42 +118,126 @@ static void flush_pending(JNIEnv* env, jobject cb, jclass cbCls, jmethodID midOn
     }
 }
 
-// ===== logits / 词表大小（不同提交可能有不同 API 名称，这里做个轻量封装）=====
-static inline const float* get_logits(llama_context* ctx) {
-    // 如你的头文件是 llama_get_logits_ith(ctx, -1)，改这里即可
-    return llama_get_logits(ctx);
+static void flush_pending(JNIEnv* env, jobject cb, jclass, jmethodID midOnToken) {
+    if (g_pending_utf8.empty()) return;
+    size_t cut = utf8_last_complete(g_pending_utf8);
+    if (cut == 0) return;
+    std::string out = g_pending_utf8.substr(0, cut);
+    g_pending_utf8.erase(0, cut);
+    if (!out.empty()) {
+        jstring jtok = env->NewStringUTF(out.c_str());
+        if (!jtok) return;
+        env->CallVoidMethod(cb, midOnToken, jtok);
+        env->DeleteLocalRef(jtok);
+    }
 }
-static inline int32_t vocab_size(const llama_vocab* vocab, llama_context* ctx) {
-    // 如果你的头文件有 llama_vocab_n_tokens(vocab)，可改成它
+
+// ===== API 轻封装 =====
+static inline const float* get_logits(llama_context* ctx) {
+    return llama_get_logits(ctx);             // 兼容面最广
+}
+static inline int32_t vocab_size(const llama_vocab* vocab) {
     return llama_vocab_n_tokens(vocab);
 }
-static inline llama_token greedy_argmax(const float* logits, int32_t n_vocab) {
-    int32_t best = 0; float bestv = -std::numeric_limits<float>::infinity();
-    for (int32_t i = 0; i < n_vocab; ++i) { if (logits[i] > bestv) { bestv = logits[i]; best = i; } }
-    return (llama_token)best;
+static inline llama_token tok_eos(const llama_vocab* vocab) {
+    return llama_vocab_eos(vocab);
+}
+static inline int token_to_piece(const llama_vocab* vocab, llama_token t, char* buf, int n) {
+    return llama_token_to_piece(vocab, t, buf, n, 0, false);
+}
+static std::vector<llama_token> tokenize_text(const std::string& text, bool add_special, bool parse_special) {
+    int32_t need = llama_tokenize(g_vocab, text.c_str(), (int32_t)text.size(), nullptr, 0, add_special, parse_special);
+    if (need < 0) need = -need;
+    std::vector<llama_token> out(need);
+    int32_t n = llama_tokenize(g_vocab, text.c_str(), (int32_t)text.size(), out.data(), (int32_t)out.size(), add_special, parse_special);
+    if (n < 0) out.clear(); else out.resize(n);
+    return out;
+}
+static std::string detok_piece(llama_token t) {
+    char buf[256];
+    int m = token_to_piece(g_vocab, t, buf, (int)sizeof(buf));
+    if (m <= 0) return {};
+    return std::string(buf, buf + m);
 }
 
-// ===== 构造 llama_batch（单序列 0）=====
-struct BatchBuf {
-    std::vector<llama_token>    token;
-    std::vector<llama_pos>      pos;
-    std::vector<int32_t>        n_seq_id;
-    std::vector<llama_seq_id>   seq_id_store;
-    std::vector<llama_seq_id*>  seq_id_ptrs;
-    std::vector<int8_t>         logits;
+// ===== 上下文保护/重置 =====
+static void rebuild_context_if_needed() {
+    // 重建上下文（当无法清 KV 时的兜底）
+    if (g_ctx) { llama_free(g_ctx); g_ctx = nullptr; }
+    g_ctx = llama_init_from_model(g_model, g_cparams);
+}
 
-    void resize(int32_t n) {
-        token.resize(n);
-        pos.resize(n);
+static void reset_session() {
+#if defined(LLAMA_SUPPORTS_KV_CACHE_CLEAR) || defined(LLAMA_KV_CACHE_CLEAR)
+    llama_kv_cache_clear(g_ctx);
+#else
+    // 没有 kv_clear/seq_rm，就重建上下文
+    rebuild_context_if_needed();
+#endif
+}
+
+// 适配上下文长度，预留余量
+static std::vector<llama_token> fit_to_context(const std::vector<llama_token>& in, int32_t n_ctx_capacity) {
+    const int32_t reserve = 32;
+    if ((int32_t)in.size() <= n_ctx_capacity - reserve) return in;
+    int32_t keep = std::max(0, n_ctx_capacity - reserve);
+    std::vector<llama_token> out;
+    if (keep > 0) out.insert(out.end(), in.end() - keep, in.end());
+    return out;
+}
+
+// ===== 采样器链（新版签名）=====
+struct SamplerDeleter { void operator()(llama_sampler* s) const { if (s) llama_sampler_free(s); } };
+
+static std::unique_ptr<llama_sampler, SamplerDeleter> make_sampler_chain() {
+    // 2025+ 版：需要 params 结构体
+    llama_sampler_chain_params params{};
+    params.no_perf = false;              // 保留统计
+    llama_sampler *chain = llama_sampler_chain_init(params);
+
+    llama_sampler_chain_add(chain, llama_sampler_init_penalties(g_samp.repeat_last_n, g_samp.repeat_penalty, 0.0f, 0.0f));
+
+    if (g_samp.top_k > 0) {
+        llama_sampler_chain_add(chain, llama_sampler_init_top_k(g_samp.top_k));
+    }
+    if (g_samp.min_p > 0.0f) {
+        llama_sampler_chain_add(chain, llama_sampler_init_min_p(g_samp.min_p, g_samp.min_keep));
+    }
+    if (g_samp.top_p > 0.0f && g_samp.top_p < 1.0f) {
+        llama_sampler_chain_add(chain, llama_sampler_init_top_p(g_samp.top_p, g_samp.min_keep));
+    }
+    if (g_samp.temp > 0.0f) {
+        llama_sampler_chain_add(chain, llama_sampler_init_temp(g_samp.temp));
+    } else {
+        llama_sampler_chain_add(chain, llama_sampler_init_greedy());
+    }
+    return std::unique_ptr<llama_sampler, SamplerDeleter>(chain, SamplerDeleter{});
+}
+
+static llama_token sample_next(llama_context* ctx, llama_sampler* sampler) {
+    return llama_sampler_sample(sampler, ctx, -1);
+}
+
+// ===== 通用 prefill =====
+struct BatchBuf {
+    std::vector<llama_token>   token;
+    std::vector<llama_pos>     pos;
+    std::vector<int32_t>       n_seq_id;
+    std::vector<llama_seq_id>  seq_id_store;
+    std::vector<llama_seq_id*> seq_id_ptrs;
+    std::vector<int8_t>        logits;
+
+    void resize(int n) {
+        token.resize(n); pos.resize(n);
         n_seq_id.assign(n, 1);
         seq_id_store.assign(n, 0);
         seq_id_ptrs.resize(n);
         logits.assign(n, 0);
-        for (int32_t i = 0; i < n; ++i) seq_id_ptrs[i] = &seq_id_store[i];
+        for (int i = 0; i < n; ++i) seq_id_ptrs[i] = &seq_id_store[i];
     }
     llama_batch as_batch() {
         llama_batch b{};
-        b.n_tokens = (int32_t)token.size();
+        b.n_tokens = (int)token.size();
         b.token    = token.data();
         b.embd     = nullptr;
         b.pos      = pos.data();
@@ -184,191 +248,184 @@ struct BatchBuf {
     }
 };
 
-// ===== 分词（vocab 版，自动扩容）=====
-static std::vector<llama_token> tokenize_text(const std::string& text, bool add_special, bool parse_special) {
-    std::vector<llama_token> out;
-    int32_t need = llama_tokenize(
-            g_vocab, text.c_str(), (int32_t)text.size(),
-            /*tokens*/ nullptr, /*max*/ 0, add_special, parse_special);
-    if (need < 0) need = -need;
-    out.resize(need);
-    int32_t n = llama_tokenize(
-            g_vocab, text.c_str(), (int32_t)text.size(),
-            out.data(), (int32_t)out.size(), add_special, parse_special);
-    if (n < 0) out.clear(); else out.resize(n);
-    return out;
+static bool prefill_tokens(const std::vector<llama_token>& ptok, int32_t& cur_pos, bool want_logits) {
+    if (ptok.empty()) return false;
+    BatchBuf pre; pre.resize((int)ptok.size());
+    for (int i = 0; i < (int)ptok.size(); ++i) {
+        pre.token[i]  = ptok[i];
+        pre.pos[i]    = i;
+        pre.logits[i] = (i + 1 == (int)ptok.size()) ? (want_logits ? 1 : 0) : 0;
+    }
+    if (llama_decode(g_ctx, pre.as_batch()) != 0) {
+        LOGE("prefill decode failed");
+        return false;
+    }
+    cur_pos = (int)ptok.size();
+    return true;
 }
 
-// ===== 反词元（vocab 版）=====
-static std::string detok_piece(llama_token t) {
-    char buf[256];
-    int32_t m = llama_token_to_piece(g_vocab, t, buf, (int32_t)sizeof(buf),
-            /*lstrip*/ 0, /*special*/ false);
-    if (m <= 0) return std::string();
-    return std::string(buf, buf + m);
-}
-
-// ===== JNI: init(modelPath, nCtx) =====
+// ===== JNI: init =====
 extern "C" JNIEXPORT jboolean JNICALL
-Java_com_kingsun_plugins_llm_LLMPlugin_nativeInit(JNIEnv* env, jclass, jstring modelPath_, jint nCtx) {
+Java_com_kingsun_plugins_llm_LlamaNative_nativeInit(JNIEnv* env, jclass, jstring modelPath_, jint nCtx) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+
     const char* p = env->GetStringUTFChars(modelPath_, nullptr);
+    std::string path = p ? p : "";
+    env->ReleaseStringUTFChars(modelPath_, p);
+
+    if (g_ctx) { llama_free(g_ctx); g_ctx = nullptr; }
+    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
+    g_vocab = nullptr;
+    g_pending_utf8.clear();
 
     llama_backend_init();
 
     llama_model_params mparams = llama_model_default_params();
-    g_model = llama_load_model_from_file(p, mparams);
+    mparams.use_mmap  = true;
+    mparams.use_mlock = false;
 
-    env->ReleaseStringUTFChars(modelPath_, p);
-    if (!g_model) return JNI_FALSE;
+    g_model = llama_model_load_from_file(path.c_str(), mparams);
+    if (!g_model) { LOGE("load model failed"); llama_backend_free(); return JNI_FALSE; }
 
     g_vocab = llama_model_get_vocab(g_model);
-    if (!g_vocab) {
-        llama_free_model(g_model); g_model = nullptr;
-        return JNI_FALSE;
-    }
+    if (!g_vocab) { LOGE("get vocab failed"); llama_model_free(g_model); g_model=nullptr; llama_backend_free(); return JNI_FALSE; }
 
-    llama_context_params cparams = llama_context_default_params();
-    cparams.n_ctx = nCtx > 0 ? nCtx : 1024;
-    cparams.type_k = GGML_TYPE_Q8_0;
-    cparams.type_v = GGML_TYPE_Q8_0;
+    g_cparams = llama_context_default_params();
+    g_cparams.n_ctx    = (nCtx > 0 ? nCtx : 2048);
+    g_cparams.type_k   = GGML_TYPE_Q8_0;
+    g_cparams.type_v   = GGML_TYPE_Q8_0;
+    int ncpu = std::max(2, (int)sysconf(_SC_NPROCESSORS_ONLN) - 1);
+    g_cparams.n_threads = ncpu;
 
-    g_ctx = llama_new_context_with_model(g_model, cparams);
+    g_ctx = llama_init_from_model(g_model, g_cparams);
     if (!g_ctx) {
-        llama_free_model(g_model); g_model = nullptr; g_vocab = nullptr;
+        LOGE("new context failed");
+        llama_model_free(g_model); g_model=nullptr; g_vocab=nullptr;
+        llama_backend_free();
         return JNI_FALSE;
     }
+
+    LOGI("nativeInit OK n_ctx=%d threads=%d", g_cparams.n_ctx, g_cparams.n_threads);
     return JNI_TRUE;
 }
 
-// ===== JNI: free() =====
+// ===== JNI: free =====
 extern "C" JNIEXPORT void JNICALL
-Java_com_kingsun_plugins_llm_LLMPlugin_nativeFree(JNIEnv*, jclass) {
+Java_com_kingsun_plugins_llm_LlamaNative_nativeFree(JNIEnv*, jclass) {
+    std::lock_guard<std::mutex> lk(g_mutex);
     if (g_ctx)   { llama_free(g_ctx); g_ctx = nullptr; }
-    if (g_model) { llama_free_model(g_model); g_model = nullptr; }
-    g_pending_utf8.clear();
+    if (g_model) { llama_model_free(g_model); g_model = nullptr; }
     g_vocab = nullptr;
+    g_pending_utf8.clear();
     llama_backend_free();
 }
 
-// ===== JNI: stop() =====
+// ===== JNI: stop =====
 extern "C" JNIEXPORT void JNICALL
-Java_com_kingsun_plugins_llm_LLMPlugin_nativeStop(JNIEnv*, jclass) {
-    g_stop = true;
-    g_pending_utf8.clear();
+Java_com_kingsun_plugins_llm_LlamaNative_nativeStop(JNIEnv*, jclass) {
+    g_stop.store(true, std::memory_order_relaxed);
 }
 
-// ===== JNI: 流式对话 =====
+// ===== JNI: set sampling =====
 extern "C" JNIEXPORT void JNICALL
-Java_com_kingsun_plugins_llm_LLMPlugin_nativeChatStream(JNIEnv* env, jobject thiz, jstring userText_) {
-    LOGI("Enter nativeChatStream");
-    if (!g_ctx || !g_model || !g_vocab) return;
-    LOGI("Process nativeChatStream Step-1");
-    // ① 缓存类与方法 ID（本次调用内复用）
+Java_com_kingsun_plugins_llm_LlamaNative_nativeSetSampling(JNIEnv*, jclass,
+                                                         jfloat temp, jfloat topP, jint topK, jfloat repeatPenalty, jint repeatLastN, jfloat minP) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    g_samp.temp           = std::max(0.f, (float)temp);
+    g_samp.top_p          = std::clamp((float)topP, 0.f, 1.f);
+    g_samp.top_k          = std::max(0, (int)topK);
+    g_samp.repeat_penalty = std::max(0.0f, (float)repeatPenalty);
+    g_samp.repeat_last_n  = std::max(0, (int)repeatLastN);
+    g_samp.min_p          = std::clamp((float)minP, 0.f, 1.f);
+    // min_keep 保持 1，避免采样坍缩
+    g_samp.min_keep       = 1;
+}
+
+// ===== JNI: chat 流式 =====
+extern "C" JNIEXPORT void JNICALL
+Java_com_kingsun_plugins_llm_LlamaNative_nativeChatStream(JNIEnv* env, jobject thiz, jstring userText_) {
+    std::lock_guard<std::mutex> lk(g_mutex);
+    if (!g_ctx || !g_model || !g_vocab) { LOGE("not initialized"); return; }
+
     jclass cbCls = env->GetObjectClass(thiz);
     if (!cbCls) return;
-    LOGI("Process nativeChatStream Step-2");
     jmethodID midOnToken = env->GetMethodID(cbCls, "onNativeToken", "(Ljava/lang/String;)V");
     jmethodID midOnDone  = env->GetMethodID(cbCls, "onNativeDone",  "()V");
     if (!midOnToken || !midOnDone) { env->DeleteLocalRef(cbCls); return; }
-    LOGI("Process nativeChatStream Step-3");
+
     const char* ut = env->GetStringUTFChars(userText_, nullptr);
-    std::string prompt = build_chatml_prompt(ut ? std::string(ut) : std::string());
+    std::string user = ut ? ut : "";
     env->ReleaseStringUTFChars(userText_, ut);
 
-    // Prefill
-    std::vector<llama_token> ptok = tokenize_text(prompt, /*add_special*/true, /*parse_special*/true);
-    if (ptok.empty()) return;
-    LOGI("Process nativeChatStream Step-4");
-    g_stop = false;
+    std::string prompt = build_chatml_prompt(user);
 
-    // 预填充
-    {
-        BatchBuf pre; pre.resize((int32_t)ptok.size());
-        for (int32_t i = 0; i < (int32_t)ptok.size(); ++i) {
-            pre.token[i]  = ptok[i];
-            pre.pos[i]    = i;
-            pre.logits[i] = 0; // 不取 logits
-        }
-        llama_batch b = pre.as_batch();
-        if (llama_decode(g_ctx, b) != 0) {
-            return;
-        }
+    // 清 session（没有 KV 清理 API 就重建上下文）
+    reset_session();
+    g_pending_utf8.clear();
+    g_stop.store(false, std::memory_order_relaxed);
+
+    auto ptok = tokenize_text(prompt, true, true);
+    ptok = fit_to_context(ptok, llama_n_ctx(g_ctx));
+
+    int32_t cur_pos = 0;
+    if (!prefill_tokens(ptok, cur_pos, true)) {
+        env->CallVoidMethod(thiz, midOnDone);
+        env->DeleteLocalRef(cbCls);
+        return;
     }
-    LOGI("Process nativeChatStream Step-5");
-    const llama_token tok_eos = llama_vocab_eos(g_vocab);
-    const int32_t n_vocab = vocab_size(g_vocab, g_ctx);
 
-    // 逐 token 生成
+    auto sampler = make_sampler_chain();
     BatchBuf step; step.resize(1);
-    int32_t cur_pos = (int32_t)ptok.size();
     const int32_t max_new = 512;
 
-    for (int32_t i = 0; i < max_new && !g_stop.load(); ++i, ++cur_pos) {
-        const float* logits = get_logits(g_ctx);
-        if (!logits) break;
+    for (int i = 0; i < max_new && !g_stop.load(std::memory_order_relaxed); ++i, ++cur_pos) {
+        llama_token next = sample_next(g_ctx, sampler.get());
+        if (next == tok_eos(g_vocab)) break;
 
-        llama_token next = greedy_argmax(logits, n_vocab);
-        if (next == tok_eos) break;
-
-        // ② 使用缓存的 midOnToken 发送（不会产生类引用泄漏）
         std::string piece = detok_piece(next);
         if (!piece.empty()) emit_utf8_safely(env, thiz, cbCls, midOnToken, piece);
 
-        // 送回模型并请求输出 logits
         step.token[0]  = next;
         step.pos[0]    = cur_pos;
         step.logits[0] = 1;
 
-        llama_batch b = step.as_batch();
-        if (llama_decode(g_ctx, b) != 0) break;
+        if (llama_decode(g_ctx, step.as_batch()) != 0) break;
     }
+
     flush_pending(env, thiz, cbCls, midOnToken);
     env->CallVoidMethod(thiz, midOnDone);
     env->DeleteLocalRef(cbCls);
-    LOGI("Process nativeChatStream Step-6");
 }
 
-// ===== JNI: 一次性生成（作文）=====
+// ===== JNI: 一次性生成 =====
 extern "C" JNIEXPORT jstring JNICALL
-Java_com_kingsun_plugins_llm_LLMPlugin_nativeGenerateOnce(JNIEnv* env, jobject /*thiz*/,
+Java_com_kingsun_plugins_llm_LlamaNative_nativeGenerateOnce(JNIEnv* env, jobject,
                                                           jstring prompt_, jint maxNew_) {
+    std::lock_guard<std::mutex> lk(g_mutex);
     if (!g_ctx || !g_model || !g_vocab) return env->NewStringUTF("");
 
     const char* p = env->GetStringUTFChars(prompt_, nullptr);
-    std::string prompt = p ? std::string(p) : std::string();
+    std::string prompt = p ? p : "";
     env->ReleaseStringUTFChars(prompt_, p);
 
-    // Prefill
-    std::vector<llama_token> ptok = tokenize_text(prompt, /*add_special*/true, /*parse_special*/true);
-    if (ptok.empty()) return env->NewStringUTF("");
+    reset_session();
+    g_pending_utf8.clear();
+    g_stop.store(false, std::memory_order_relaxed);
 
-    {
-        BatchBuf pre; pre.resize((int32_t)ptok.size());
-        for (int32_t i = 0; i < (int32_t)ptok.size(); ++i) {
-            pre.token[i]  = ptok[i];
-            pre.pos[i]    = i;
-            pre.logits[i] = 0;
-        }
-        llama_batch b = pre.as_batch();
-        if (llama_decode(g_ctx, b) != 0) {
-            return env->NewStringUTF("");
-        }
-    }
+    auto ptok = tokenize_text(prompt, true, true);
+    ptok = fit_to_context(ptok, llama_n_ctx(g_ctx));
 
-    const llama_token tok_eos = llama_vocab_eos(g_vocab);
-    const int32_t n_vocab = vocab_size(g_vocab, g_ctx);
-    const int32_t max_new = std::max(32, (int32_t)maxNew_);
+    int32_t cur_pos = 0;
+    if (!prefill_tokens(ptok, cur_pos, true)) return env->NewStringUTF("");
 
+    auto sampler = make_sampler_chain();
     std::string out;
     BatchBuf step; step.resize(1);
-    int32_t cur_pos = (int32_t)ptok.size();
+    int32_t max_new = std::max(32, (int32_t)maxNew_);
 
-    for (int32_t i = 0; i < max_new; ++i, ++cur_pos) {
-        const float* logits = get_logits(g_ctx);
-        if (!logits) break;
-
-        llama_token next = greedy_argmax(logits, n_vocab);
-        if (next == tok_eos) break;
+    for (int i = 0; i < max_new && !g_stop.load(std::memory_order_relaxed); ++i, ++cur_pos) {
+        llama_token next = sample_next(g_ctx, sampler.get());
+        if (next == tok_eos(g_vocab)) break;
 
         std::string piece = detok_piece(next);
         if (!piece.empty()) out.append(piece);
@@ -376,9 +433,41 @@ Java_com_kingsun_plugins_llm_LLMPlugin_nativeGenerateOnce(JNIEnv* env, jobject /
         step.token[0]  = next;
         step.pos[0]    = cur_pos;
         step.logits[0] = 1;
-        llama_batch b = step.as_batch();
-        if (llama_decode(g_ctx, b) != 0) break;
+        if (llama_decode(g_ctx, step.as_batch()) != 0) break;
     }
-
     return env->NewStringUTF(out.c_str());
+}
+
+// ===== （可选）构造作文 Prompt =====
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_kingsun_plugins_llm_LlamaNative_nativeBuildEssayPrompt(JNIEnv* env, jclass,
+                                                              jstring jTitle, jint jWordLimit,
+                                                              jstring jLang, jobjectArray jHiErr,
+                                                              jobjectArray jHiFreq) {
+    const char* ctitle = env->GetStringUTFChars(jTitle, nullptr);
+    const char* clang  = env->GetStringUTFChars(jLang,  nullptr);
+    std::string title = ctitle ? ctitle : "";
+    std::string lang  = clang  ? clang  : "English";
+    env->ReleaseStringUTFChars(jTitle, ctitle);
+    env->ReleaseStringUTFChars(jLang,  clang);
+
+    auto to_vec = [&](jobjectArray arr)->std::vector<std::string>{
+        std::vector<std::string> v;
+        if (!arr) return v;
+        jsize n = env->GetArrayLength(arr);
+        v.reserve(std::max<jsize>(n, 0));
+        for (jsize i = 0; i < n; ++i) {
+            jstring s = (jstring)env->GetObjectArrayElement(arr, i);
+            const char* cs = env->GetStringUTFChars(s, nullptr);
+            v.emplace_back(cs ? cs : "");
+            env->ReleaseStringUTFChars(s, cs);
+            env->DeleteLocalRef(s);
+        }
+        return v;
+    };
+    auto hi_err  = to_vec(jHiErr);
+    auto hi_freq = to_vec(jHiFreq);
+
+    std::string prompt = build_essay_prompt(title, (int)jWordLimit, lang, hi_err, hi_freq);
+    return env->NewStringUTF(prompt.c_str());
 }

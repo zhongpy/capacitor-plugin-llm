@@ -1,6 +1,6 @@
 {
   "name": "capacitor-plugin-llm",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "This plugin is an engine of llm, It's used to generate article or chat with user.",
   "main": "dist/plugin.cjs.js",
   "module": "dist/esm/index.js",
