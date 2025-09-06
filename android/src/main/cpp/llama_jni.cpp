@@ -82,53 +82,127 @@ static std::string build_essay_prompt(
 // ===== UTF-8 安全拼接 =====
 static std::string g_pending_utf8;
 
-static size_t utf8_last_complete(const std::string& s) {
-    size_t n = s.size();
-    if (n == 0) return 0;
-    size_t i = n;
-    for (size_t k = 0; k < 3 && i > 0; ++k) {
-        unsigned char c = (unsigned char)s[i - 1];
-        if ((c & 0xC0) == 0x80) --i; else break;
+// ========== 新增：UTF-8 -> UTF-16 安全解码器（只解到“完整码点”为止”） ==========
+static size_t utf8_decode_to_utf16_partial(const std::string &in,
+                                           std::u16string &out_u16) {
+    out_u16.clear();
+    const uint8_t *p = (const uint8_t *)in.data();
+    size_t i = 0, n = in.size();
+
+    auto emit_u16 = [&](uint32_t cp) {
+        if (cp <= 0xFFFF) {
+            // 避免直接落入代理区
+            if (cp >= 0xD800 && cp <= 0xDFFF) cp = 0xFFFD;
+            out_u16.push_back((char16_t)cp);
+        } else if (cp <= 0x10FFFF) {
+            cp -= 0x10000;
+            char16_t hi = (char16_t)(0xD800 + (cp >> 10));
+            char16_t lo = (char16_t)(0xDC00 + (cp & 0x3FF));
+            out_u16.push_back(hi);
+            out_u16.push_back(lo);
+        } else {
+            out_u16.push_back((char16_t)0xFFFD);
+        }
+    };
+
+    while (i < n) {
+        uint8_t b0 = p[i];
+
+        if (b0 < 0x80) {
+            // ASCII
+            emit_u16(b0);
+            ++i;
+        } else if ((b0 & 0xE0) == 0xC0) {
+            if (i + 1 >= n) break; // 不完整
+            uint8_t b1 = p[i + 1];
+            if ((b1 & 0xC0) != 0x80) { emit_u16(0xFFFD); ++i; continue; }
+            uint32_t cp = ((b0 & 0x1F) << 6) | (b1 & 0x3F);
+            // 过短（Overlong）修正
+            if (cp < 0x80) cp = 0xFFFD;
+            emit_u16(cp);
+            i += 2;
+        } else if ((b0 & 0xF0) == 0xE0) {
+            if (i + 2 >= n) break;
+            uint8_t b1 = p[i + 1], b2 = p[i + 2];
+            if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80) { emit_u16(0xFFFD); ++i; continue; }
+            uint32_t cp = ((b0 & 0x0F) << 12) | ((b1 & 0x3F) << 6) | (b2 & 0x3F);
+            // 过短或代理区
+            if (cp < 0x800) cp = 0xFFFD;
+            emit_u16(cp);
+            i += 3;
+        } else if ((b0 & 0xF8) == 0xF0) {
+            if (i + 3 >= n) break;
+            uint8_t b1 = p[i + 1], b2 = p[i + 2], b3 = p[i + 3];
+            if ((b1 & 0xC0) != 0x80 || (b2 & 0xC0) != 0x80 || (b3 & 0xC0) != 0x80) { emit_u16(0xFFFD); ++i; continue; }
+            uint32_t cp = ((b0 & 0x07) << 18) | ((b1 & 0x3F) << 12) | ((b2 & 0x3F) << 6) | (b3 & 0x3F);
+            // 合法范围
+            if (cp < 0x10000 || cp > 0x10FFFF) cp = 0xFFFD;
+            emit_u16(cp);
+            i += 4;
+        } else {
+            // 非法起始字节，跳过 1
+            emit_u16(0xFFFD);
+            ++i;
+        }
     }
-    if (i == 0) return 0;
-    unsigned char lead = (unsigned char)s[i - 1];
-    int need = 1;
-    if ((lead & 0x80) == 0x00) need = 1;
-    else if ((lead & 0xE0) == 0xC0) need = 2;
-    else if ((lead & 0xF0) == 0xE0) need = 3;
-    else if ((lead & 0xF8) == 0xF0) need = 4;
-    else return i - 1;
-    int have = (int)(n - (i - 1));
-    if (have >= need) return n;
-    return n - (need - have);
+    // 返回“已安全消费”的字节数（剩余的是不完整尾巴，留给下一次）
+    return i;
 }
 
-static void emit_utf8_safely(JNIEnv* env, jobject cb, jclass cbCls, jmethodID midOnToken,
+// ========== 修改：用 UTF-16 发给 Java（避免 NewStringUTF 的 Modified-UTF8 限制） ==========
+static void emit_utf8_safely(JNIEnv* env, jobject cb, jclass /*cbCls*/, jmethodID midOnToken,
                              const std::string& chunk) {
+    // 累积 UTF-8
     g_pending_utf8.append(chunk);
-    size_t cut = utf8_last_complete(g_pending_utf8);
-    if (cut == 0) return;
-    std::string out = g_pending_utf8.substr(0, cut);
-    g_pending_utf8.erase(0, cut);
-    if (!out.empty()) {
-        jstring jtok = env->NewStringUTF(out.c_str());
-        if (!jtok) return;
-        env->CallVoidMethod(cb, midOnToken, jtok);
-        env->DeleteLocalRef(jtok);
+
+    // 尝试解码尽可能多的“完整码点”
+    std::u16string u16;
+    size_t consumed = utf8_decode_to_utf16_partial(g_pending_utf8, u16);
+    if (consumed == 0 || u16.empty()) {
+        // 还没有完整码点，等下次
+        return;
     }
+
+    // 从 pending 中移除已消费字节
+    g_pending_utf8.erase(0, consumed);
+
+    // 通过 UTF-16 构建 Java 字符串
+    jstring jtok = env->NewString(reinterpret_cast<const jchar*>(u16.data()),
+                                  static_cast<jsize>(u16.size()));
+    if (!jtok) return;
+    env->CallVoidMethod(cb, midOnToken, jtok);
+    env->DeleteLocalRef(jtok);
 }
 
-static void flush_pending(JNIEnv* env, jobject cb, jclass, jmethodID midOnToken) {
+static void flush_pending(JNIEnv* env, jobject cb, jclass /*cbCls*/, jmethodID midOnToken) {
     if (g_pending_utf8.empty()) return;
-    size_t cut = utf8_last_complete(g_pending_utf8);
-    if (cut == 0) return;
-    std::string out = g_pending_utf8.substr(0, cut);
-    g_pending_utf8.erase(0, cut);
-    if (!out.empty()) {
-        jstring jtok = env->NewStringUTF(out.c_str());
-        if (!jtok) return;
-        env->CallVoidMethod(cb, midOnToken, jtok);
-        env->DeleteLocalRef(jtok);
+
+    std::u16string u16;
+    size_t consumed = utf8_decode_to_utf16_partial(g_pending_utf8, u16);
+
+    if (consumed > 0 && !u16.empty()) {
+        jstring jtok = env->NewString(reinterpret_cast<const jchar*>(u16.data()),
+                                      static_cast<jsize>(u16.size()));
+        if (jtok) {
+            env->CallVoidMethod(cb, midOnToken, jtok);
+            env->DeleteLocalRef(jtok);
+        }
+        g_pending_utf8.erase(0, consumed);
+    }
+
+    // 若仍有残留（不完整尾巴），为了输出对齐，可以在结束时丢弃或补 U+FFFD：
+    if (!g_pending_utf8.empty()) {
+        // 方案 A：丢弃
+        // g_pending_utf8.clear();
+
+        // 方案 B：输出一个 U+FFFD 表示替代字符
+        std::u16string repl(1, (char16_t)0xFFFD);
+        jstring jtok2 = env->NewString(reinterpret_cast<const jchar*>(repl.data()), 1);
+        if (jtok2) {
+            env->CallVoidMethod(cb, midOnToken, jtok2);
+            env->DeleteLocalRef(jtok2);
+        }
+        g_pending_utf8.clear();
     }
 }
 
@@ -145,6 +219,17 @@ static inline llama_token tok_eos(const llama_vocab* vocab) {
 static inline int token_to_piece(const llama_vocab* vocab, llama_token t, char* buf, int n) {
     return llama_token_to_piece(vocab, t, buf, n, 0, false);
 }
+static inline llama_token greedy_argmax(const float* logits, int32_t n_vocab) {
+    int32_t best = 0;
+    float bests = -std::numeric_limits<float>::infinity();
+    for (int32_t i = 0; i < n_vocab; ++i) {
+        if (logits[i] > bests) {
+            bests = logits[i]; best = i;
+        }
+    }
+    return (llama_token)best;
+}
+
 static std::vector<llama_token> tokenize_text(const std::string& text, bool add_special, bool parse_special) {
     int32_t need = llama_tokenize(g_vocab, text.c_str(), (int32_t)text.size(), nullptr, 0, add_special, parse_special);
     if (need < 0) need = -need;
@@ -185,15 +270,13 @@ static std::vector<llama_token> fit_to_context(const std::vector<llama_token>& i
     if (keep > 0) out.insert(out.end(), in.end() - keep, in.end());
     return out;
 }
-
+static std::unique_ptr<llama_sampler, void(*)(llama_sampler*)> g_sampler{nullptr, llama_sampler_free};
 // ===== 采样器链（新版签名）=====
 struct SamplerDeleter { void operator()(llama_sampler* s) const { if (s) llama_sampler_free(s); } };
 
-static std::unique_ptr<llama_sampler, SamplerDeleter> make_sampler_chain() {
-    // 2025+ 版：需要 params 结构体
-    llama_sampler_chain_params params{};
-    params.no_perf = false;              // 保留统计
-    llama_sampler *chain = llama_sampler_chain_init(params);
+static void rebuild_sampler_chain() {
+    if (!g_model) return;
+    llama_sampler *chain = llama_sampler_chain_init(llama_sampler_chain_default_params());
 
     llama_sampler_chain_add(chain, llama_sampler_init_penalties(g_samp.repeat_last_n, g_samp.repeat_penalty, 0.0f, 0.0f));
 
@@ -211,11 +294,22 @@ static std::unique_ptr<llama_sampler, SamplerDeleter> make_sampler_chain() {
     } else {
         llama_sampler_chain_add(chain, llama_sampler_init_greedy());
     }
-    return std::unique_ptr<llama_sampler, SamplerDeleter>(chain, SamplerDeleter{});
+    llama_sampler_chain_add(chain, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    g_sampler.reset(chain);
 }
 
-static llama_token sample_next(llama_context* ctx, llama_sampler* sampler) {
-    return llama_sampler_sample(sampler, ctx, -1);
+static llama_token sample_next_token(llama_context* ctx, llama_sampler* smpl) {
+    if (!ctx || !smpl) return LLAMA_TOKEN_NULL;
+
+    // 直接用“最后一步 logits”：idx = -1（符合最新版头文件示例）
+    // 该调用内部会执行：apply + select（并不会自动 accept）
+    llama_token id = llama_sampler_sample(smpl, ctx, -1);  // <-- 关键
+
+    // 选择成功后要 accept，更新内部状态（比如重复惩罚、grammar 等）
+    if (id != LLAMA_TOKEN_NULL) {
+        llama_sampler_accept(smpl, id);
+    }
+    return id;
 }
 
 // ===== 通用 prefill =====
@@ -374,21 +468,29 @@ Java_com_kingsun_plugins_llm_LlamaNative_nativeChatStream(JNIEnv* env, jobject t
         return;
     }
 
-    auto sampler = make_sampler_chain();
+    if (!g_sampler) {
+        rebuild_sampler_chain();
+    }
     BatchBuf step; step.resize(1);
     const int32_t max_new = 512;
 
     for (int i = 0; i < max_new && !g_stop.load(std::memory_order_relaxed); ++i, ++cur_pos) {
-        llama_token next = sample_next(g_ctx, sampler.get());
+        llama_token next = sample_next_token(g_ctx, g_sampler.get());
+        if (next == LLAMA_TOKEN_NULL) {
+            LOGW("sampler returned NULL token, fallback to greedy or stop");
+            // 可选：fallback
+            const float *logits = get_logits(g_ctx);
+            if (logits) {
+                next = greedy_argmax(logits, vocab_size(g_vocab));
+            }
+            if (next == LLAMA_TOKEN_NULL) break;
+        }
         if (next == tok_eos(g_vocab)) break;
-
         std::string piece = detok_piece(next);
         if (!piece.empty()) emit_utf8_safely(env, thiz, cbCls, midOnToken, piece);
-
         step.token[0]  = next;
         step.pos[0]    = cur_pos;
         step.logits[0] = 1;
-
         if (llama_decode(g_ctx, step.as_batch()) != 0) break;
     }
 
@@ -418,13 +520,22 @@ Java_com_kingsun_plugins_llm_LlamaNative_nativeGenerateOnce(JNIEnv* env, jobject
     int32_t cur_pos = 0;
     if (!prefill_tokens(ptok, cur_pos, true)) return env->NewStringUTF("");
 
-    auto sampler = make_sampler_chain();
+    rebuild_sampler_chain();
     std::string out;
     BatchBuf step; step.resize(1);
     int32_t max_new = std::max(32, (int32_t)maxNew_);
 
     for (int i = 0; i < max_new && !g_stop.load(std::memory_order_relaxed); ++i, ++cur_pos) {
-        llama_token next = sample_next(g_ctx, sampler.get());
+        llama_token next = sample_next_token(g_ctx, g_sampler.get());
+        if (next == LLAMA_TOKEN_NULL) {
+            LOGW("sampler returned NULL token, fallback to greedy or stop");
+            // 可选：fallback
+            const float *logits = get_logits(g_ctx);
+            if (logits) {
+                next = greedy_argmax(logits, vocab_size(g_vocab));
+            }
+            if (next == LLAMA_TOKEN_NULL) break;
+        }
         if (next == tok_eos(g_vocab)) break;
 
         std::string piece = detok_piece(next);
